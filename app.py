@@ -2,13 +2,12 @@ import streamlit as st
 import pandas as pd
 import io
 import plotly.express as px
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 
 # --- KONFIGURACE STRÁNKY ---
-st.set_page_config(page_title="Warehouse Performance Pro", layout="wide", page_icon="🏭")
+st.set_page_config(page_title="WMS Analytics Ultimate", layout="wide", page_icon="🏭")
 
 # --- DEFINICE PAUZ ---
-# Formát: (Hodina_od, Minuta_od, Hodina_do, Minuta_do)
 BREAKS = [
     (8, 15, 8, 30),
     (11, 0, 11, 30),
@@ -18,218 +17,189 @@ BREAKS = [
     (20, 30, 20, 45)
 ]
 
-def is_time_in_break(dt_check):
-    """Pomocná funkce: Zjistí, zda je daný čas uvnitř pauzy."""
-    t = dt_check.time()
-    for h_start, m_start, h_end, m_end in BREAKS:
-        start = time(h_start, m_start)
-        end = time(h_end, m_end)
-        if start <= t <= end:
-            return True
-    return False
+# --- PARAMETRY SKLADU ---
+ROW_CHANGE_PENALTY = 20  # "Cena" za přejetí do jiné řady (ekvivalent X pozic v regálu)
+KLT_START = "00496000004606000000"
+KLT_END   = "00496000004606000500"
 
-def calculate_net_delay(start_dt, end_dt):
-    """
-    Vypočítá dobu trvání mezi dvěma časy a odečte oficiální pauzy.
-    Vrací: (celková_doba_sec, čistá_doba_sec, strávený_čas_na_pauze_sec)
-    """
-    if pd.isna(start_dt) or pd.isna(end_dt):
-        return 0, 0, 0
-    
-    total_duration = (end_dt - start_dt).total_seconds()
-    
-    if total_duration < 0: 
-        return 0, 0, 0 # Chyba v datech (konec před začátkem)
+# --- POMOCNÉ FUNKCE ---
 
-    # Pokud je prodleva velmi dlouhá (např. přes noc), pauzy neřešíme tak detailně,
-    # ale pro směnu (do 12h) to projdeme minutu po minutě pro přesnost, 
-    # nebo rychleji pomocí intervalů. Zde robustní varianta intervalů:
+def parse_bin_coords(bin_str):
+    """
+    Rozparsuje string '13-01-01-01' na (Řada, Sloupec).
+    Vrací: (row, bay) jako int
+    """
+    s = str(bin_str).strip()
+    # Očekáváme formát XX-XX-XX-XX
+    parts = s.split('-')
+    if len(parts) >= 2:
+        try:
+            row = int(parts[0]) # 13 až 18
+            bay = int(parts[1]) # 01 až 37
+            return row, bay
+        except ValueError:
+            return None, None
+    return None, None
+
+def calculate_distance_score(curr_bin, prev_bin):
+    """
+    Vypočítá logickou vzdálenost mezi dvěma biny.
+    """
+    r1, b1 = parse_bin_coords(curr_bin)
+    r2, b2 = parse_bin_coords(prev_bin)
     
-    break_seconds = 0
+    if r1 is None or r2 is None:
+        return 0 # Nelze spočítat
     
-    # Procházíme definované pauzy
-    # Vytvoříme plné datetime objekty pro pauzy v den "start_dt" a "end_dt"
-    # (zjednodušení: předpokládáme, že pick netrvá přes půlnoc do dalšího dne s pauzami)
+    # Logika: Rozdíl v řadách * Penalizace + Rozdíl v sloupcích
+    row_diff = abs(r1 - r2)
+    bay_diff = abs(b1 - b2)
     
-    current_day = start_dt.date()
-    
-    for h_start, m_start, h_end, m_end in BREAKS:
-        b_start = datetime.combine(current_day, time(h_start, m_start))
-        b_end = datetime.combine(current_day, time(h_end, m_end))
-        
-        # Průnik intervalů [start_dt, end_dt] a [b_start, b_end]
-        overlap_start = max(start_dt, b_start)
-        overlap_end = min(end_dt, b_end)
-        
-        if overlap_start < overlap_end:
-            break_seconds += (overlap_end - overlap_start).total_seconds()
+    return (row_diff * ROW_CHANGE_PENALTY) + bay_diff
+
+def calculate_net_time(start_dt, end_dt):
+    """Čistý čas bez pauz."""
+    if pd.isna(start_dt) or pd.isna(end_dt): return 0
+    total = (end_dt - start_dt).total_seconds()
+    if total < 0 or total > 43200: return max(0, total) # Limit 12h
+
+    break_sec = 0
+    day = start_dt.date()
+    for h1, m1, h2, m2 in BREAKS:
+        b_s = datetime.combine(day, time(h1, m1))
+        b_e = datetime.combine(day, time(h2, m2))
+        ov_s = max(start_dt, b_s)
+        ov_e = min(end_dt, b_e)
+        if ov_s < ov_e: break_sec += (ov_e - ov_s).total_seconds()
             
-    net_duration = max(0, total_duration - break_seconds)
-    
-    return total_duration, net_duration, break_seconds
+    return max(0, total - break_sec)
 
-# --- NAČTENÍ A ZPRACOVÁNÍ ---
 @st.cache_data
 def process_data(uploaded_file):
     # 1. Načtení
     if uploaded_file.name.endswith('.csv'):
-        try:
-            df = pd.read_csv(uploaded_file)
-        except:
-            uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file, sep=';')
-    else:
-        df = pd.read_excel(uploaded_file)
+        try: df = pd.read_csv(uploaded_file)
+        except: uploaded_file.seek(0); df = pd.read_csv(uploaded_file, sep=';')
+    else: df = pd.read_excel(uploaded_file)
 
-    # 2. Timestamp
+    # 2. Timestamp & Clean
     df['PickTimestamp'] = pd.to_datetime(
-        df['Confirmation date.1'].astype(str) + ' ' + df['Confirmation time.1'].astype(str),
-        errors='coerce'
+        df['Confirmation date.1'].astype(str) + ' ' + df['Confirmation time.1'].astype(str), errors='coerce'
     )
     df = df.dropna(subset=['PickTimestamp'])
     
-    # 3. Sort pro výpočet pick-to-pick
-    # Řadíme podle uživatele a času, abychom viděli jeho workflow
+    # 3. Typ Picku
+    def get_type(row):
+        if pd.notna(row.get('Certificate Number', None)): return 'Paleta'
+        val = str(row.get('Unloading Point', ''))
+        # Fix pro vědecký formát excelu
+        if 'e+' in val or '.' in val: 
+            try: val = '{:.0f}'.format(float(val))
+            except: pass
+        if len(val) >= 18 and KLT_START <= val <= KLT_END: return 'KLT'
+        return 'Ostatní'
+    df['Typ'] = df.apply(get_type, axis=1)
+
+    # 4. Řazení a výpočty (User flow)
     df = df.sort_values(by=['User', 'PickTimestamp'])
-    
-    # 4. Výpočty prodlev (User based)
     df['PrevTimestamp'] = df.groupby('User')['PickTimestamp'].shift(1)
+    df['PrevBin'] = df.groupby('User')['Source Storage Bin'].shift(1)
     
-    # Aplikace logiky odečtu pauz (chvíli to trvá, proto progress bar)
-    # Vektorizace je složitá kvůli časům, použijeme apply
-    def calc_row_delay(row):
-        return calculate_net_delay(row['PrevTimestamp'], row['PickTimestamp'])
+    # Časy
+    df['Net_Seconds'] = df.apply(lambda r: calculate_net_time(r['PrevTimestamp'], r['PickTimestamp']), axis=1)
+    df['Prodleva_min'] = df['Net_Seconds'] / 60
+    
+    # Vzdálenost
+    df['Distance_Score'] = df.apply(lambda r: calculate_distance_score(r['Source Storage Bin'], r['PrevBin']), axis=1)
+    
+    # 5. Souřadnice pro mapu
+    coords = df['Source Storage Bin'].apply(parse_bin_coords)
+    df['Row_Num'] = [c[0] if c else None for c in coords]
+    df['Bay_Num'] = [c[1] if c else None for c in coords]
 
-    # Výsledek je tuple, rozdělíme do sloupců
-    delay_stats = df.apply(calc_row_delay, axis=1, result_type='expand')
-    df['Gross_Duration_Sec'] = delay_stats[0]
-    df['Net_Duration_Sec'] = delay_stats[1]
-    df['Break_Duration_Sec'] = delay_stats[2]
-    
-    df['Prodleva_min_Net'] = df['Net_Duration_Sec'] / 60
-    df['Prodleva_min_Gross'] = df['Gross_Duration_Sec'] / 60
-    
-    # Detekce změny zakázky (pro kontext)
-    df['PrevOrder'] = df.groupby('User')['Transfer Order Number'].shift(1)
-    df['New_Task'] = df['Transfer Order Number'] != df['PrevOrder']
+    # Clean Output Columns
+    cols = ['User', 'PickTimestamp', 'Prodleva_min', 'Distance_Score', 'Typ', 
+            'Source Storage Bin', 'PrevBin', 'Transfer Order Number', 'Material', 'Material Description', 'Row_Num', 'Bay_Num']
+    final = [c for c in cols if c in df.columns]
+    return df[final]
 
-    # 5. Delivery Analytics (Doba trvání Dodávky)
-    # Pokud sloupec Delivery neexistuje, použijeme Transfer Order
-    group_col = 'Delivery' if 'Delivery' in df.columns else 'Transfer Order Number'
-    
-    delivery_stats = df.groupby(group_col).agg(
-        Del_Start=('PickTimestamp', 'min'),
-        Del_End=('PickTimestamp', 'max'),
-        Del_Items=('Material', 'count'),
-        Del_User=('User', 'first') # Předpoklad: dodávku dělá jeden člověk (nebo bere prvního)
-    ).reset_index()
-    
-    delivery_stats['Delivery_Duration'] = delivery_stats['Del_End'] - delivery_stats['Del_Start']
-    delivery_stats['Delivery_Duration_Min'] = delivery_stats['Delivery_Duration'].dt.total_seconds() / 60
-    
-    # Merge zpět do hlavního DF
-    df = df.merge(delivery_stats[[group_col, 'Delivery_Duration_Min', 'Del_Items']], on=group_col, how='left')
+# --- UI ---
+st.title("🏭 Ultimate Warehouse Analytics")
+st.markdown("Pokročilá analýza zohledňující **pauzy**, **typ balení** a **vzdálenost ve skladu**.")
 
-    return df, delivery_stats
-
-# --- UI LOGIKA ---
-st.title("🏭 Profesionální Analýza Pickování & Dodávek")
-st.markdown("""
-Tato aplikace analyzuje efektivitu skladu. 
-**Automaticky odečítá pauzy:** 8:15, 11:00, 12:45, 16:15, 18:30, 20:30.
-""")
-
-uploaded_file = st.sidebar.file_uploader("📂 Nahrát data (XLSX/CSV)", type=['xlsx', 'csv'])
+uploaded_file = st.sidebar.file_uploader("Nahrát data", type=['xlsx', 'csv'])
 
 if uploaded_file:
-    with st.spinner('Počítám čisté časy, odečítám pauzy...'):
-        df, df_delivery = process_data(uploaded_file)
-
-    # --- FILTRY ---
-    st.sidebar.header("🔍 Nastavení reportu")
-    min_delay = st.sidebar.slider("Zobrazit prodlevy delší než (minuty):", 5, 120, 15)
-    users = st.sidebar.multiselect("Filtrovat skladníky:", df['User'].unique(), default=df['User'].unique())
+    with st.spinner('Počítám trasy a časy...'):
+        df = process_data(uploaded_file)
+        
+    # Filtry
+    st.sidebar.header("Filtry")
+    users = st.sidebar.multiselect("Skladníci", sorted(df['User'].unique()), default=sorted(df['User'].unique()))
+    min_delay = st.sidebar.slider("Minimální prodleva (min)", 0, 90, 10)
     
-    # Filtrace
-    mask = (df['Prodleva_min_Net'] > min_delay) & (df['User'].isin(users))
-    # Ignorujeme první pick dne (kde je prev time NaT)
-    mask = mask & (df['PrevTimestamp'].notna())
-    # Ignorujeme extrémy (např. přes víkend - limit 8 hodin)
-    mask = mask & (df['Prodleva_min_Net'] < 480) 
+    # Aplikace filtru
+    # Ignorujeme první pick dne (kde není předchozí čas) a extrémy nad 8 hodin
+    mask = (df['User'].isin(users)) & (df['Prodleva_min'] > min_delay) & (df['Prodleva_min'] < 480) & (df['Distance_Score'] > -1)
+    df_show = df[mask].copy()
     
-    df_filtered = df[mask].copy()
-
-    # --- 1. KPI PŘEHLED ---
-    st.subheader("📊 Manažerský přehled")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Celkový čistý prostoj", f"{df_filtered['Prodleva_min_Net'].sum()/60:.1f} hod")
-    c2.metric("Počet incidentů", len(df_filtered))
-    c3.metric("Průměrná čistá prodleva", f"{df_filtered['Prodleva_min_Net'].mean():.1f} min")
+    # --- 1. MATICE PODEZŘENÍ (Scatter) ---
+    st.subheader("🕵️ Matice Podezření: Čas vs. Vzdálenost")
+    st.info("💡 **Jak číst graf:** Body vlevo nahoře jsou **kritické** (Dlouhý čas + Malá vzdálenost). Body vpravo nahoře jsou OK (Dlouhý čas, ale musel jet daleko).")
     
-    # Nejhorší dodávka
-    slowest_del = df_delivery.sort_values('Delivery_Duration_Min', ascending=False).iloc[0]
-    c4.metric(f"Nejpomalejší Dodávka", f"{slowest_del['Delivery_Duration_Min']:.0f} min", help=str(slowest_del['Delivery']))
-
-    st.divider()
-
-    # --- 2. GRAFY ---
+    fig_scatter = px.scatter(
+        df_show, 
+        x="Distance_Score", 
+        y="Prodleva_min", 
+        color="User",
+        hover_data=['Source Storage Bin', 'PrevBin', 'Material'],
+        size='Prodleva_min',
+        title="Efektivita přesunu (Osa X: Vzdálenost, Osa Y: Čas)"
+    )
+    # Přidáme "hranici efektivity" (volitelně)
+    st.plotly_chart(fig_scatter, use_container_width=True)
+    
+    # --- 2. MAPA SKLADU (Heatmap) ---
     col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown("### 🏆 Efektivita dle uživatelů (Čisté prostoje)")
-        user_sum = df_filtered.groupby('User')['Prodleva_min_Net'].sum().reset_index().sort_values('Prodleva_min_Net', ascending=False)
-        fig = px.bar(user_sum, x='User', y='Prodleva_min_Net', color='Prodleva_min_Net', 
-                     title="Suma minut prostoje (očištěno o pauzy)", color_continuous_scale='RdYlGn_r')
-        st.plotly_chart(fig, use_container_width=True)
+        st.subheader("🗺️ Kde se nejvíce 'stojí'? (Mapa skladu)")
+        if df_show['Row_Num'].notna().any():
+            # Agregace prostojů podle pozice
+            map_data = df_show.groupby(['Row_Num', 'Bay_Num'])['Prodleva_min'].sum().reset_index()
+            fig_map = px.density_heatmap(
+                map_data, x="Bay_Num", y="Row_Num", z="Prodleva_min",
+                nbinsx=37, nbinsy=6, text_auto=True,
+                color_continuous_scale="Reds",
+                title="Suma prostojů dle lokace (Řada 13-18)"
+            )
+            fig_map.update_yaxes(autorange="reversed") # Aby řada 13 byla nahoře
+            st.plotly_chart(fig_map, use_container_width=True)
+        else:
+            st.warning("Nelze zobrazit mapu - nepodařilo se načíst souřadnice binů.")
 
     with col2:
-        st.markdown("### 📦 Délka trvání Dodávek (Delivery)")
-        # Histogram délek dodávek
-        fig2 = px.histogram(df_delivery[df_delivery['Delivery_Duration_Min'] < 300], x="Delivery_Duration_Min", 
-                            nbins=30, title="Rozložení času kompletace dodávek (minuty)")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.subheader("📊 Statistiky")
+        st.metric("Počet podezřelých picků", len(df_show))
+        if not df_show.empty:
+            avg_speed = (df_show['Distance_Score'] / df_show['Prodleva_min']).mean()
+            st.metric("Průměrná efektivita pohybu", f"{avg_speed:.2f} score/min")
+        
+        # Top 5 "Hříšníků" (dle sumy času na místě)
+        top_sinners = df_show.groupby('User')['Prodleva_min'].sum().sort_values(ascending=False).head(5)
+        st.write("Top 5 uživatelů s prostoji (suma minut):")
+        st.dataframe(top_sinners)
 
     # --- 3. DETAILNÍ DATA ---
-    st.subheader("📋 Detailní analýza prostojů")
+    st.subheader("📋 Detailní seznam")
+    st.dataframe(df_show.sort_values(by='Prodleva_min', ascending=False), use_container_width=True)
     
-    # Příprava detailní tabulky pro zobrazení
-    cols_display = [
-        'User', 'Transfer Order Number', 'Delivery', 'Material', 
-        'PickTimestamp', 'Prodleva_min_Net', 'Prodleva_min_Gross', 'Break_Duration_Sec',
-        'Source Storage Bin', 'Dest.Storage Bin', 'Target quantity'
-    ]
-    # Ošetření, aby sloupce existovaly
-    cols_final = [c for c in cols_display if c in df_filtered.columns]
-    
-    st.dataframe(
-        df_filtered[cols_final].sort_values(by='Prodleva_min_Net', ascending=False).style.format({
-            'Prodleva_min_Net': '{:.1f}', 
-            'Prodleva_min_Gross': '{:.1f}'
-        }),
-        use_container_width=True
-    )
-
-    # --- 4. EXPORT ---
-    st.subheader("📥 Export dat")
-    
+    # Export
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        # List 1: Prostoje
-        df_export = df_filtered.copy()
-        df_export.to_excel(writer, sheet_name='Prostoje_Detail', index=False)
-        
-        # List 2: Statistiky Dodávek
-        df_delivery.to_excel(writer, sheet_name='Delivery_Stats', index=False)
-        
-        # List 3: Kompletní data (volitelné, může být velké)
-        # df.to_excel(writer, sheet_name='Raw_Data', index=False)
-        
-    st.download_button(
-        label="Stáhnout kompletní Profesionální Report (.xlsx)",
-        data=buffer.getvalue(),
-        file_name=f"Warehouse_Report_{datetime.now().strftime('%Y%m%d')}.xlsx",
-        mime="application/vnd.ms-excel"
-    )
+        df_show.to_excel(writer, sheet_name='Detaily', index=False)
+    
+    st.download_button("📥 Stáhnout Report (.xlsx)", buffer.getvalue(), "Warehouse_Ultimate.xlsx", "application/vnd.ms-excel")
 
 else:
-    st.info("Nahrajte soubor v bočním menu.")
+    st.info("Nahrajte soubor.")
