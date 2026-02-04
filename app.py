@@ -5,7 +5,7 @@ import plotly.express as px
 from datetime import datetime, time
 
 # --- KONFIGURACE ---
-st.set_page_config(page_title="WMS Analytics v11", layout="wide", page_icon="🏭")
+st.set_page_config(page_title="WMS Analytics v12", layout="wide", page_icon="🏭")
 
 # --- KONSTANTY & NASTAVENÍ ---
 BREAKS = [
@@ -21,7 +21,7 @@ ROW_CHANGE_PENALTY = 25
 KLT_START = "00496000004606000000"
 KLT_END   = "00496000004606000500"
 
-# --- DATA PRO EXCEL LEGENDU (DOPLNĚNO) ---
+# --- DATA PRO EXCEL LEGENDU ---
 LEGENDA_DATA = [
     {"Sloupec": "User", "Popis": "Identifikace skladníka (osobní číslo)."},
     {"Sloupec": "PickTimestamp", "Popis": "Datum a čas potvrzení položky."},
@@ -46,13 +46,9 @@ def clean_delivery_id(val):
     """Oprava formátu Delivery (odstraní .0 a převede na string)."""
     if pd.isna(val): return ""
     s_val = str(val).strip()
-    # Odstranění desetinné části, pokud existuje
     if '.' in s_val:
-        try:
-            # Převedeme na float a pak na int, tím zmizí desetinná část
-            s_val = str(int(float(s_val)))
-        except:
-            pass # Pokud to nejde, necháme původní
+        try: s_val = str(int(float(s_val)))
+        except: pass
     return s_val
 
 def clean_unloading_point(val):
@@ -160,8 +156,8 @@ def process_data(uploaded_file):
     return df[[c for c in cols if c in df.columns]], del_stats
 
 # --- UI APLIKACE ---
-st.title("🏭 Warehouse Analytics v11")
-st.markdown("Kompletní dashboard s čistými daty a rozšířenou legendou.")
+st.title("🏭 Warehouse Analytics v12")
+st.markdown("Dashboard pro analýzu pickování, dodávek a materiálů.")
 
 uploaded_file = st.sidebar.file_uploader("Nahrát data", type=['xlsx', 'csv'])
 
@@ -175,18 +171,28 @@ if uploaded_file:
         users = st.sidebar.multiselect("Skladníci", sorted(df['User'].unique()), default=sorted(df['User'].unique()))
         min_delay = st.sidebar.slider("Minimální prodleva (min)", 0, 90, 10)
         
+        # 1. Dataset filtrovaný podle uživatelů (ale bez limitu prodlevy - pro celkové průměry)
+        df_users_only = df[df['User'].isin(users)].copy()
+        
+        # 2. Dataset plně filtrovaný (včetně limitu prodlevy - pro zobrazení incidentů)
         mask = (df['User'].isin(users)) & (df['Prodleva_min'] > min_delay) & (df['Prodleva_min'] < 480)
         df_show = df[mask].copy()
 
         # ZÁLOŽKY
-        tab1, tab2, tab3, tab4 = st.tabs(["🕵️ Analýza Prostojů", "🚚 Analýza Dodávek", "🗺️ Mapa Skladu", "📦 Analýza Materiálů"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "🕵️ Analýza Prostojů", 
+            "🚚 Analýza Dodávek", 
+            "🗺️ Mapa Skladu", 
+            "📦 Analýza Materiálů",
+            "📈 Průměrné Statistiky"
+        ])
 
         # 1. PROSTOJE
         with tab1:
             st.info("""
             **Jak číst tento graf:**
-            * **Osa X (Vodorovná):** Vzdálenost (Distance Score).
-            * **Osa Y (Svislá):** Čas (minuty).
+            * **Osa X:** Vzdálenost (Distance Score).
+            * **Osa Y:** Čas (minuty).
             * **Levý Horní Roh = 🚩 PODEZŘELÉ** (Stál a nejel).
             """)
             if not df_show.empty:
@@ -208,11 +214,9 @@ if uploaded_file:
             """)
             if not df_delivery.empty:
                 top_del = df_delivery.sort_values(by='Trvani_min', ascending=False).head(20)
-                # Formátování tabulky - Delivery jako string
                 st.dataframe(top_del.style.format({'Trvani_min': '{:.1f} min'}), use_container_width=True)
                 fig_del = px.bar(top_del.head(10), x='Delivery', y='Trvani_min', color='User',
                                  title="10 Nejpomalejších Dodávek")
-                # Vynutíme, aby osa X (Delivery) byla kategorie (text), ne číslo
                 fig_del.update_xaxes(type='category')
                 st.plotly_chart(fig_del, use_container_width=True)
 
@@ -221,7 +225,6 @@ if uploaded_file:
             st.info("""
             **Jak číst tento graf:**
             * Tmavě červená místa = **Zóny častých prostojů**.
-            * Mapa odpovídá fyzickému rozložení (Řady 13-18).
             """)
             if df_show['Row_Num'].notna().any():
                 map_data = df_show.groupby(['Row_Num', 'Bay_Num'])['Prodleva_min'].sum().reset_index()
@@ -234,8 +237,8 @@ if uploaded_file:
         with tab4:
             st.info("""
             **Jak číst tento graf:**
-            * **Osa X:** Frekvence (jak často se bere).
-            * **Osa Y:** Rychlost (jak dlouho to trvá).
+            * **Osa X:** Frekvence.
+            * **Osa Y:** Rychlost (čas).
             * **Pravý Horní Roh = 🚩 KRITICKÉ POLOŽKY.**
             """)
             df_mat = df[df['Prodleva_min'] < 480].copy()
@@ -254,8 +257,54 @@ if uploaded_file:
                         hover_name="Material Description", color_continuous_scale="RdYlGn_r"
                     )
                     st.plotly_chart(fig_mat, use_container_width=True)
-                    st.write("🔝 **Top 20 nejztrátovějších materiálů:**")
                     st.dataframe(mat_stats.sort_values('Celkova_Prodleva', ascending=False).head(20).style.format({'Prumerna_Prodleva': '{:.1f} min'}), use_container_width=True)
+
+        # 5. PRŮMĚRNÉ STATISTIKY (NOVÉ)
+        with tab5:
+            st.subheader("📊 Průměrné ukazatele výkonnosti")
+            st.markdown("Data vypočítána pro vybrané uživatele.")
+            
+            # Výpočty nad VŠEMI daty uživatelů (nejen nad incidenty)
+            # aby průměr 'Tempo' byl reálný
+            avg_pick_time = df_users_only['Prodleva_min'].mean()
+            
+            # Výpočty nad INCIDENTY (df_show)
+            avg_incident = df_show['Prodleva_min'].mean() if not df_show.empty else 0
+            
+            if not df_delivery.empty:
+                avg_delivery = df_delivery['Trvani_min'].mean()
+                avg_items = df_delivery['Pocet_Polozek'].mean()
+            else:
+                avg_delivery = 0
+                avg_items = 0
+
+            # KARTY
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Průměrné Tempo (Vše)", f"{avg_pick_time:.1f} min", help="Průměrný čas mezi jakýmikoliv dvěma picky (včetně rychlých).")
+            col2.metric(f"Průměrný Incident (>{min_delay} min)", f"{avg_incident:.1f} min", help="Když už nastane prodleva, jak dlouho průměrně trvá.")
+            col3.metric("Průměrná Dodávka", f"{avg_delivery:.1f} min", help="Průměrný čas kompletace celé dodávky.")
+            col4.metric("Položek na Dodávku", f"{avg_items:.1f} ks")
+            
+            st.divider()
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Porovnání KLT vs Paleta (Průměrný čas)")
+                type_stats = df_users_only.groupby('Typ_Picku')['Prodleva_min'].mean().reset_index()
+                fig_type = px.bar(type_stats, x='Typ_Picku', y='Prodleva_min', color='Typ_Picku', 
+                                  text_auto='.1f', title="Průměrný čas na 1 pick (minuty)")
+                st.plotly_chart(fig_type, use_container_width=True)
+                
+            with c2:
+                st.subheader("Výkonnost v čase (Hodinový průměr)")
+                # Přidáme hodinu
+                df_users_only['Hodina'] = df_users_only['PickTimestamp'].dt.hour
+                hourly_stats = df_users_only.groupby('Hodina')['Prodleva_min'].mean().reset_index()
+                
+                fig_hour = px.line(hourly_stats, x='Hodina', y='Prodleva_min', markers=True,
+                                   title="Průměrná doba picku dle hodiny dne")
+                fig_hour.update_layout(xaxis=dict(tickmode='linear', dtick=1))
+                st.plotly_chart(fig_hour, use_container_width=True)
 
         # --- EXPORT ---
         st.subheader("📥 Stáhnout Report")
@@ -275,6 +324,6 @@ if uploaded_file:
             worksheet.set_column('A:A', 25)
             worksheet.set_column('B:B', 80)
 
-        st.download_button("Stáhnout Kompletní Report (.xlsx)", buffer.getvalue(), "WMS_Master_Report_v11.xlsx")
+        st.download_button("Stáhnout Kompletní Report (.xlsx)", buffer.getvalue(), "WMS_Master_Report_v12.xlsx")
 else:
     st.info("Nahrajte soubor.")
