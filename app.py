@@ -5,7 +5,7 @@ import plotly.express as px
 from datetime import datetime, time
 
 # --- KONFIGURACE ---
-st.set_page_config(page_title="WMS Analytics v8", layout="wide", page_icon="📦")
+st.set_page_config(page_title="WMS Analytics v9", layout="wide", page_icon="📦")
 
 # --- KONSTANTY ---
 BREAKS = [
@@ -21,19 +21,15 @@ ROW_CHANGE_PENALTY = 25
 KLT_START = "00496000004606000000"
 KLT_END   = "00496000004606000500"
 
-# --- LEGENDA (Data pro Excel) ---
+# --- LEGENDA ---
 LEGENDA_DATA = [
-    {"Sloupec": "User", "Popis": "Identifikace skladníka (osobní číslo)."},
-    {"Sloupec": "PickTimestamp", "Popis": "Datum a čas potvrzení položky."},
-    {"Sloupec": "Prodleva_min", "Popis": "Čas strávený od PŘEDCHOZÍHO picku do TOHOTO picku (v minutách). Očištěno o pauzy."},
-    {"Sloupec": "Distance_Score", "Popis": "Index vzdálenosti. 0-5 = blízko, >20 = změna řady. Pokud je prodleva dlouhá a skóre nízké -> PROBLÉM."},
-    {"Sloupec": "Typ_Picku", "Popis": "KLT (Vozík 9ks) nebo Paleta (dle certifikátu)."},
-    {"Sloupec": "Source Storage Bin", "Popis": "Lokace, kde skladník bral zboží."},
-    {"Sloupec": "PrevBin", "Popis": "Lokace, kde byl skladník PŘEDTÍM."},
-    {"Sloupec": "Delivery", "Popis": "Číslo dodávky (sdružuje více zakázek)."},
-    {"Sloupec": "Transfer Order Number", "Popis": "Číslo konkrétního TO."},
-    {"Sloupec": "Clean_UP", "Popis": "Unloading Point (číslo KLT) očištěné od chyb formátu."},
-    {"Sloupec": "Delivery_Duration_Min", "Popis": "Celkový čas kompletace celé dodávky (od 1. do poslední položky)."},
+    {"Sloupec": "User", "Popis": "Identifikace skladníka."},
+    {"Sloupec": "Prodleva_min", "Popis": "Čistý čas práce na položce (bez pauz)."},
+    {"Sloupec": "Distance_Score", "Popis": "Index vzdálenosti (0=blízko, >20=daleko)."},
+    {"Sloupec": "Typ_Picku", "Popis": "KLT (Vozík) nebo Paleta."},
+    {"Sloupec": "Material", "Popis": "Číslo materiálu."},
+    {"Sloupec": "Prumerna_Prodleva", "Popis": "Jak dlouho průměrně trvá napickování tohoto materiálu."},
+    {"Sloupec": "Pocet_Vyskytu", "Popis": "Kolikrát byl tento materiál v daném období pickován."},
 ]
 
 # --- FUNKCE ---
@@ -108,7 +104,6 @@ def process_data(uploaded_file):
         return 'Ostatní'
     df['Typ_Picku'] = df.apply(classify, axis=1)
 
-    # Řazení a výpočty
     df = df.sort_values(by=['User', 'PickTimestamp'])
     df['PrevTimestamp'] = df.groupby('User')['PickTimestamp'].shift(1)
     df['PrevBin'] = df.groupby('User')['Source Storage Bin'].shift(1)
@@ -117,13 +112,11 @@ def process_data(uploaded_file):
     df['Prodleva_min'] = df['Net_Seconds'] / 60
     df['Distance_Score'] = df.apply(lambda r: calculate_distance_score(r['Source Storage Bin'], r['PrevBin']), axis=1)
     
-    # Mapování
     coords = df['Source Storage Bin'].apply(parse_bin_coords)
     df['Row_Num'] = [c[0] if c else None for c in coords]
     df['Bay_Num'] = [c[1] if c else None for c in coords]
 
-    # --- NOVÉ: VÝPOČET DELIVERIES ---
-    # Seskupíme data podle Delivery, najdeme start (min time) a konec (max time)
+    # Deliveries
     if 'Delivery' in df.columns:
         del_stats = df.groupby('Delivery').agg(
             Start=('PickTimestamp', 'min'),
@@ -132,7 +125,6 @@ def process_data(uploaded_file):
             User=('User', 'first')
         ).reset_index()
         del_stats['Trvani_min'] = (del_stats['End'] - del_stats['Start']).dt.total_seconds() / 60
-        # Ošetření záporných hodnot (pokud jsou data divná)
         del_stats = del_stats[del_stats['Trvani_min'] >= 0]
     else:
         del_stats = pd.DataFrame()
@@ -140,13 +132,11 @@ def process_data(uploaded_file):
     cols = ['User', 'PickTimestamp', 'Prodleva_min', 'Distance_Score', 'Typ_Picku', 
             'Source Storage Bin', 'PrevBin', 'Delivery', 'Transfer Order Number', 'Material', 
             'Material Description', 'Clean_UP', 'Row_Num', 'Bay_Num']
-    
-    final_cols = [c for c in cols if c in df.columns]
-    return df[final_cols], del_stats
+    return df[[c for c in cols if c in df.columns]], del_stats
 
 # --- UI ---
-st.title("🏭 Warehouse Analytics v8")
-st.markdown("Obsahuje **Legendu**, **Analýzu Dodávek** a **Očištění dat**.")
+st.title("🏭 Warehouse Analytics v9")
+st.markdown("Novinka: **Analýza Materiálů (Heatmapa problémových položek)**.")
 
 uploaded_file = st.sidebar.file_uploader("Nahrát data", type=['xlsx', 'csv'])
 
@@ -162,8 +152,8 @@ if uploaded_file:
         mask = (df['User'].isin(users)) & (df['Prodleva_min'] > min_delay) & (df['Prodleva_min'] < 480)
         df_show = df[mask].copy()
 
-        # TABS pro přehlednost
-        tab1, tab2, tab3 = st.tabs(["🕵️ Analýza Prostojů", "🚚 Analýza Dodávek", "🗺️ Mapa Skladu"])
+        # TABS
+        tab1, tab2, tab3, tab4 = st.tabs(["🕵️ Analýza Prostojů", "🚚 Analýza Dodávek", "🗺️ Mapa Skladu", "📦 Analýza Materiálů"])
 
         with tab1:
             st.subheader("Detailní přehled prostojů")
@@ -171,67 +161,97 @@ if uploaded_file:
                 sc_data = df_show[df_show['Distance_Score'] >= 0]
                 if not sc_data.empty:
                     fig = px.scatter(sc_data, x="Distance_Score", y="Prodleva_min", color="User", 
-                                     size="Prodleva_min", hover_data=['Source Storage Bin'],
+                                     size="Prodleva_min", hover_data=['Source Storage Bin', 'Material', 'Material Description'],
                                      title="Efektivita: Čas vs. Vzdálenost")
                     fig.add_vline(x=20, line_dash="dash", annotation_text="Změna řady")
                     st.plotly_chart(fig, use_container_width=True)
                 
                 st.dataframe(df_show.sort_values(by='Prodleva_min', ascending=False).head(100))
-            else:
-                st.info("Žádné prostoje v tomto nastavení.")
 
         with tab2:
-            st.subheader("🚚 Top 20 Nejdelších Dodávek (Deliveries)")
+            st.subheader("🚚 Top Nejpomalejší Dodávky")
             if not df_delivery.empty:
                 top_del = df_delivery.sort_values(by='Trvani_min', ascending=False).head(20)
-                
-                # Formátování tabulky
-                st.dataframe(
-                    top_del.style.format({'Trvani_min': '{:.1f} min'}),
-                    use_container_width=True
-                )
-                
-                # Graf
+                st.dataframe(top_del.style.format({'Trvani_min': '{:.1f} min'}), use_container_width=True)
                 fig_del = px.bar(top_del.head(10), x='Delivery', y='Trvani_min', color='User',
-                                 title="10 Nejpomalejších Dodávek", text_auto='.0f')
+                                 title="10 Nejpomalejších Dodávek")
                 st.plotly_chart(fig_del, use_container_width=True)
-            else:
-                st.warning("Data neobsahují sloupec 'Delivery'.")
 
         with tab3:
+            st.subheader("Mapa prostojů")
             if df_show['Row_Num'].notna().any():
-                st.subheader("Heatmapa prostojů")
                 map_data = df_show.groupby(['Row_Num', 'Bay_Num'])['Prodleva_min'].sum().reset_index()
                 fig_map = px.density_heatmap(map_data, x="Bay_Num", y="Row_Num", z="Prodleva_min",
                                              nbinsx=37, nbinsy=6, text_auto=True, color_continuous_scale="Reds")
                 fig_map.update_yaxes(autorange="reversed")
                 st.plotly_chart(fig_map, use_container_width=True)
-            else:
-                st.info("Chybí souřadnice.")
+
+        with tab4:
+            st.subheader("📦 Materiálová Matice (Kde jsou problémy?)")
+            st.markdown("""
+            **Jak číst tento graf:**
+            * **Osa X (Vpravo):** Často pickované materiály.
+            * **Osa Y (Nahoře):** Materiály, které trvají dlouho.
+            * **Pravý Horní Roh = 🚩 KRITICKÉ POLOŽKY (Časté a Pomalé).**
+            """)
+            
+            # Agregace dat pro materiály (používáme nefiltrovaná data pro počty, ale filtrovaná pro prodlevy? 
+            # Lepší je vzít všechna data, která splňují základní logiku, ale ne nutně jen extrémní prostoje > 15 min,
+            # abychom měli reálný průměr. Zde použijeme df (všechna data očištěná o extrémy).
+            
+            df_mat = df[df['Prodleva_min'] < 480].copy()
+            if not df_mat.empty:
+                mat_stats = df_mat.groupby(['Material', 'Material Description']).agg(
+                    Pocet_Vyskytu=('Prodleva_min', 'count'),
+                    Prumerna_Prodleva=('Prodleva_min', 'mean'),
+                    Celkova_Prodleva=('Prodleva_min', 'sum')
+                ).reset_index()
+                
+                # Filtrujeme jen materiály, které se vyskytly alespoň 2x, aby graf nebyl zaplevelený unikáty
+                mat_stats = mat_stats[mat_stats['Pocet_Vyskytu'] > 1]
+                
+                if not mat_stats.empty:
+                    fig_mat = px.scatter(
+                        mat_stats, 
+                        x="Pocet_Vyskytu", 
+                        y="Prumerna_Prodleva", 
+                        size="Celkova_Prodleva",
+                        color="Prumerna_Prodleva",
+                        hover_name="Material Description",
+                        hover_data=["Material", "Celkova_Prodleva"],
+                        color_continuous_scale="RdYlGn_r", # Červená nahoře (pomalé)
+                        title="Analýza Materiálů: Frekvence vs. Rychlost"
+                    )
+                    st.plotly_chart(fig_mat, use_container_width=True)
+                    
+                    st.write("🔝 **Top 20 nejztrátovějších materiálů (dle celkového času):**")
+                    st.dataframe(mat_stats.sort_values('Celkova_Prodleva', ascending=False).head(20).style.format({'Prumerna_Prodleva': '{:.1f} min', 'Celkova_Prodleva': '{:.1f} min'}))
+                else:
+                    st.info("Nedostatek dat pro materiálovou analýzu (žádný materiál se neopakoval).")
 
         # --- EXPORT ---
         st.subheader("📥 Stáhnout Report")
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            # 1. Prostoje
             df_show.to_excel(writer, sheet_name='Prostoje_Detail', index=False)
             
-            # 2. Statistiky lidí
+            # Statistiky materiálů
+            if 'mat_stats' in locals() and not mat_stats.empty:
+                 mat_stats.sort_values('Celkova_Prodleva', ascending=False).to_excel(writer, sheet_name='Analyza_Materialu', index=False)
+
             user_stats = df[mask].groupby(['User', 'Typ_Picku'])['Prodleva_min'].agg(['count', 'sum', 'mean']).reset_index()
             user_stats.to_excel(writer, sheet_name='Statistiky_Lidi', index=False)
             
-            # 3. Deliveries
             if not df_delivery.empty:
                 df_delivery.sort_values(by='Trvani_min', ascending=False).to_excel(writer, sheet_name='Nejdelsi_Delivery', index=False)
             
-            # 4. LEGENDA
             pd.DataFrame(LEGENDA_DATA).to_excel(writer, sheet_name='LEGENDA', index=False)
             
-            # Formátování šířky sloupců v legendě (volitelné vylepšení)
+            # Auto-adjust columns width for Legenda
             worksheet = writer.sheets['LEGENDA']
             worksheet.set_column('A:A', 20)
             worksheet.set_column('B:B', 80)
 
-        st.download_button("Stáhnout Excel Report", buffer.getvalue(), "WMS_Report_v8.xlsx")
+        st.download_button("Stáhnout Excel Report", buffer.getvalue(), "WMS_Report_v9.xlsx")
 else:
     st.info("Nahrajte soubor.")
